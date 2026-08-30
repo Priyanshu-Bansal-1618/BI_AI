@@ -1,0 +1,108 @@
+# ============================================================
+# SEMANTIC CONTRACT
+# Single source of truth for KPI definitions, calculation logic,
+# thresholds, data lineage, and role-based access control.
+# Consumed by: anomaly detection engine, RAG retriever, LLM prompt
+# builder, and the frontend (for labels/units/permissions).
+# ============================================================
+
+version: 1.2.0
+last_updated: "2026-08-01"
+
+kpis:
+  - id: kpi.revenue
+    name: "Net Revenue"
+    domain: "sales"
+    type: structured
+    unit: "USD"
+    grain: ["day", "region", "product_line"]
+    calculation: "SUM(order_line.net_amount) WHERE order_line.status = 'completed'"
+    source_tables: ["orders", "order_lines"]
+    anomaly_thresholds:
+      z_score: 2.5          # flag if |z| > 2.5 vs rolling baseline
+      pct_change_material: 0.08   # 8% WoW move considered "material" even if z-score is borderline
+      min_baseline_periods: 14    # need >=14 periods of history for statistical baseline
+    lineage:
+      upstream:
+        - system: "Salesforce CPQ"
+          table: "orders"
+        - system: "ERP (NetSuite)"
+          table: "order_lines"
+      transformations:
+        - "dbt model: stg_orders -> fct_revenue_daily"
+    correlated_kpis: ["kpi.stockout_rate", "kpi.complaint_rate"]
+    access:
+      roles:
+        "Regional Sales Manager": { scope: "region = :own_region", fields: "all" }
+        "Supply Chain VP": { scope: "all_regions", fields: ["revenue_total", "product_line"] }  # no customer-level detail
+        "Executive": { scope: "all_regions", fields: "all" }
+
+  - id: kpi.stockout_rate
+    name: "Stockout Rate"
+    domain: "supply_chain"
+    type: structured
+    unit: "%"
+    grain: ["day", "warehouse", "product_line"]
+    calculation: "COUNT(sku_days_out_of_stock) / COUNT(sku_days_total)"
+    source_tables: ["inventory_snapshots"]
+    anomaly_thresholds:
+      z_score: 2.0
+      pct_change_material: 0.15
+      min_baseline_periods: 14
+    lineage:
+      upstream:
+        - system: "WMS (Manhattan Associates)"
+          table: "inventory_snapshots"
+      transformations:
+        - "dbt model: stg_inventory -> fct_stockout_daily"
+    correlated_kpis: ["kpi.revenue"]
+    access:
+      roles:
+        "Regional Sales Manager": { scope: "region = :own_region", fields: ["stockout_rate"] }
+        "Supply Chain VP": { scope: "all_regions", fields: "all" }
+        "Executive": { scope: "all_regions", fields: "all" }
+
+  - id: kpi.complaint_rate
+    name: "Customer Complaint Rate"
+    domain: "customer_experience"
+    type: unstructured_derived     # quantitative rate derived from unstructured ticket/review volume
+    unit: "complaints per 1,000 orders"
+    grain: ["day", "product_line"]
+    calculation: "COUNT(support_tickets WHERE sentiment='negative' AND category='product_quality') / (orders/1000)"
+    source_tables: ["support_tickets_meta"]     # structured metadata table
+    vector_source: "collection.customer_feedback"  # raw text lives in vector DB
+    anomaly_thresholds:
+      z_score: 2.0
+      pct_change_material: 0.20
+      min_baseline_periods: 10
+    lineage:
+      upstream:
+        - system: "Zendesk"
+          table: "support_tickets_meta"
+        - system: "Vector DB"
+          collection: "customer_feedback"
+      transformations:
+        - "sentiment classifier (batch job) -> support_tickets_meta.sentiment"
+    correlated_kpis: ["kpi.revenue", "kpi.stockout_rate"]
+    access:
+      roles:
+        "Regional Sales Manager": { scope: "region = :own_region", fields: ["complaint_rate"] }
+        "Supply Chain VP": { scope: "all_regions", fields: ["complaint_rate", "product_line"] }
+        "Executive": { scope: "all_regions", fields: "all" }
+
+# Roles referenced above are resolved at query time against the
+# identity claims in the FastAPI JWT (see backend/auth.py, not shown
+# in this prototype — stubbed in models.py as `current_user.role`).
+roles:
+  - "Regional Sales Manager"
+  - "Supply Chain VP"
+  - "Executive"
+
+narrative_generation_policy:
+  # Enforced in rag/llm_reasoning.py — the LLM is NEVER allowed to
+  # compute or restate a number that didn't come from the quantitative
+  # engine's output payload. It may only narrate numbers it was given.
+  allowed_to_compute: false
+  must_cite_evidence_ids: true
+  min_confidence_to_auto_send: 0.65
+  abstain_below_confidence: 0.35
